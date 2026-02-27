@@ -1,14 +1,7 @@
 /**
  * @file wallbox_control.c
  * @brief Hochverfügbare, industrielle Steuerung für PV-Überschussladen.
- * @version 2.1
- *
- * Änderungen gegenüber 2.0:
- * - Ausführlichere Kommentare zur Filter-Rundung und Sättigung.
- * - Physikalische Formel in Calculate_Charge_Power erläutert.
- * - Hardware-Zustände in Execute_Hardware_Command erklärt.
- * - Sensorfehlerbehandlung im Hauptloop kommentiert.
- * - Blockkommentar zu den Filterkoeffizienten hinzugefügt.
+ * @version 2.2
  *
  * Diese Software implementiert eine vollständige DSP-Pipeline inklusive:
  * - Kausaler FIR-Filterung mit wählbaren Fensterfunktionen (Sinc-Kern).
@@ -25,7 +18,8 @@
 #include <assert.h>
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
-#include <util/delay.h>
+#include <avr/interrupt.h>   // NEU: Für Interrupt-Steuerung
+#include <util/delay.h>       // Wird noch für Initialisierung genutzt, aber nicht mehr in der Hauptschleife
 
 /* ==========================================================================
    1. KUNDEN-KONFIGURATION (DSP & LOGIK)
@@ -311,7 +305,7 @@ PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
  * (hier vereinfacht für ohmsche Last, cos φ = 1).
  * Da der Strom in Dezi-Ampere (1/10 A) ausgegeben werden soll, wird das
  * Ergebnis mit 10 multipliziert. Beispiel: 2300 W / (230 V * 3) = 3,333 A
- * -> Beispiel: 2300 W / (230 V * 3) = 3,333 A = 33,33 dA. Durch die Multiplikation mit 10 im Zähler ((pv_surplus_w * 10) / denominator) ergibt sich der Wert direkt in dA  
+ * -> 33,33 dA. Durch die Multiplikation mit 10 im Zähler ((pv_surplus_w * 10) / denominator) ergibt sich der Wert direkt in dA.
  * 
  * @param pv_surplus_w Geglättete PV-Leistung in Watt.
  * @param active_phases Gewünschte Phasenanzahl (1 oder 3).
@@ -424,6 +418,15 @@ void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
     }
 }
 
+// ==========================================================================
+// NEU: Timer-Interrupt für 10-Hz-Takt
+// ==========================================================================
+volatile bool timer_flag = false;   // Flag wird im Interrupt gesetzt
+
+ISR(TIMER1_COMPA_vect) {
+    timer_flag = true;
+}
+
 /* ==========================================================================
    7. MAIN LOOP (Zentrale Ablaufsteuerung)
    ========================================================================== */
@@ -447,49 +450,56 @@ int main(void) {
     int16_t smooth_pv = 0; 
     int16_t last_valid_pv = 0;
 
-    // 3. Unendliche Steuerungsschleife (Takt: 10Hz)
+    // NEU: Timer1 für 10 Hz konfigurieren (CTC-Modus, Vorteiler 64)
+    // Annahme: Taktfrequenz 16 MHz. Bei abweichendem Takt muss OCR1A angepasst werden.
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC, Vorteiler 64
+    OCR1A = 24999;  // (16000000 / 64) / 10 - 1 = 24999
+    TIMSK1 = (1 << OCIE1A); // Interrupt bei Compare Match A aktivieren
+    sei(); // Globale Interrupts einschalten
+
+    // 3. Unendliche Steuerungsschleife (nicht-blockierend)
     while(1) {
-        int16_t raw_pv = Read_PV_Surplus_Watts();
-        
-        // Sensor-Validierung mit Ersatzwert bei Fehlern
-        if (Validate_PV_Value(raw_pv, &sensor_error_counter)) {
-            last_valid_pv = raw_pv;
-        } else {
-            // Bei ungültigem Sensorwert setzen wir den Filtereingang auf 0.
-            // Das führt zu einem schnellen Abfall des Filterausgangs und verhindert,
-            // dass alte Werte eingefroren werden. Nach PV_MAX_ERRORS (ca. 5 s) erfolgt
-            // dann die vollständige Abschaltung (Not-Aus).
-            last_valid_pv = 0;
-        }
-        
-        // Sicherheitsebene: Not-Aus bei Sensor- oder Hardware-Versagen
-        if (sensor_error_counter >= PV_MAX_ERRORS || hw_controller.hardware_fault) {
-            current_cmd.active_phases = PHASES_OFF;
-            current_cmd.target_current_da = 0;
-            // Kein direkter PWM-Aufruf mehr – Befehl wird über Hardware-Controller ausgeführt
-        } else {
-            // Signalaufbereitung (DSP) – Rückgabewert wird ignoriert, da nicht benötigt
-            FIR_Process(&pv_filter, last_valid_pv, fir_coeffs, &smooth_pv);
+        // Nur wenn der Timer-Interrupt ein neues 100-ms-Intervall signalisiert
+        if (timer_flag) {
+            timer_flag = false; // Flag zurücksetzen
+
+            // --- Beginn der Regelung (wie bisher, jedoch ohne _delay_ms) ---
+            int16_t raw_pv = Read_PV_Surplus_Watts();
             
-            // Logik-Verarbeitung (1x pro Sekunde)
-            tick_counter_1sec++;
-            if (tick_counter_1sec >= 10) {
-                tick_counter_1sec = 0;
-                PhaseMode target_phases = Hysteresis_Process(&phase_hysteresis, (int32_t)smooth_pv);
-                current_cmd = Calculate_Charge_Power((int32_t)smooth_pv, target_phases);
+            // Sensor-Validierung mit Ersatzwert bei Fehlern
+            if (Validate_PV_Value(raw_pv, &sensor_error_counter)) {
+                last_valid_pv = raw_pv;
+            } else {
+                last_valid_pv = 0;
             }
+            
+            if (sensor_error_counter >= PV_MAX_ERRORS || hw_controller.hardware_fault) {
+                current_cmd.active_phases = PHASES_OFF;
+                current_cmd.target_current_da = 0;
+            } else {
+                FIR_Process(&pv_filter, last_valid_pv, fir_coeffs, &smooth_pv);
+                
+                tick_counter_1sec++;
+                if (tick_counter_1sec >= 10) {
+                    tick_counter_1sec = 0;
+                    PhaseMode target_phases = Hysteresis_Process(&phase_hysteresis, (int32_t)smooth_pv);
+                    current_cmd = Calculate_Charge_Power((int32_t)smooth_pv, target_phases);
+                }
+            }
+
+            Execute_Hardware_Command(&hw_controller, current_cmd);
+            // --- Ende der Regelung ---
+
+            // NEU: Watchdog-Reset NUR nach erfolgreicher Regelung
+            // Falls die Regelung in einer Endlosschleife hängen bleibt,
+            // wird der Watchdog nicht mehr bedient und löst nach 2 Sekunden einen Reset aus.
+            wdt_reset();
         }
 
-        // Hardware-Aktion (auch im Not-Aus wird der Befehl PHASES_OFF ausgeführt)
-        Execute_Hardware_Command(&hw_controller, current_cmd);
-
-        // Zeitbasis: Physisches Warten auf den nächsten 100ms Takt
-        // Hinweis: Blockierendes Delay – für zukünftige Erweiterungen (z.B. Kommunikation)
-        // sollte ein Timer-basiertes Design verwendet werden.
-        _delay_ms(100); 
-        
-        // Lebenszeichen an den Watchdog (Nur wenn Loop komplett durchlaufen)
-        wdt_reset(); 
+        // Platz für andere Aufgaben (z.B. UART-Kommunikation, Tasterabfrage, …)
+        // Diese werden hier in jedem Schleifendurchlauf ausgeführt, unabhängig vom Timer-Flag.
+        // Sie dürfen jedoch nicht so lange blockieren, dass der Watchdog zwischendurch auslösen würde.
+        // (Die maximale Blockadezeit muss kleiner als 2 s sein, oder man setzt auch hier wdt_reset().)
     }
 
     return 0; // Nie erreicht
