@@ -1,8 +1,6 @@
 Integration & Hardware-Test (Checkliste)
 Damit diese Steuerung auf deiner Hardware sicher läuft, prüfe vor dem Flashen folgende Punkte:
 
-Taktfrequenz (Timer-Werte): Die Timer1-Konfiguration (OCR1A = 24999; mit Prescaler 64) ist exakt für einen 16 MHz Systemtakt (z. B. Arduino Nano/Uno) berechnet, um präzise 10 Hz zu liefern. Verwendest du einen 8 MHz Chip, musst du den Wert in der Initialisierung halbieren.
-
 Hardware Abstraction Layer (HAL) implementieren: Du musst die drei extern-Funktionen (Sensorik lesen, Relais schalten, PWM setzen) für deine spezifische Hardware (z. B. I2C-Sensoren, GPIO-Pins) in einer separaten Datei implementieren.
 
 Non-Blocking Treiber: Stelle sicher, dass deine implementierten I2C-/Hardware-Treiber bei Kommunikationsfehlern nicht in Endlosschleifen hängen bleiben, sondern mit false oder 0 zurückkehren. Nur so kann unsere Zustandsmaschine greifen.
