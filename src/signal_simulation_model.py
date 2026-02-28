@@ -1,16 +1,17 @@
 /**
  * ==========================================================================
- * WALLBOX CONTROL SYSTEM V2.6 - SIL SIMULATION EDITION 
+ * WALLBOX CONTROL SYSTEM V2.6 - SIL SIMULATION EDITION (MIT DEBUG-AUSGABEN)
  * ==========================================================================
  * Dieser Code bildet die industrielle Logik aus V2.6 originalgetreu ab und
- * ergänzt eine Testbench für die Ausführung auf dem PC (z.B. OnlineGDB).
+ * ergänzt ausführliche Debug-Meldungen, um das Systemverhalten nachvollziehbar
+ * zu machen.
  * 
- * Korrekturen gegenüber der ersten Simulationsversion:
- * - Execute_Hardware_Command: Phasenwechsel nur bei PHASES_1/PHASES_3.
- * - Execute_Hardware_Command: Retry-Logik und hardware_fault originalgetreu.
- * - HardwareController_Init: Alle Felder initialisiert.
- * - FIR_Process: SAFE_ASSERT(out_sample != NULL) wieder eingefügt.
- * - retry_counter wird nun korrekt verwendet.
+ * Änderungen gegenüber der letzten Version:
+ * - Phasenwechsel werden mit Grund ausgegeben.
+ * - Strombegrenzung (Min/Max) wird angezeigt.
+ * - I2C-Crash und seine Auswirkungen werden explizit gemeldet.
+ * - Zustand der Hardware-Zustandsmaschine wird bei Änderungen protokolliert.
+ * - PWM-Ausgaben werden auf 1x pro Sekunde reduziert (entferntere Ausgabe).
  */
 
 #include <stdio.h>
@@ -64,10 +65,14 @@ const int16_t fir_coeffs[32] PROGMEM = {
 };
 
 typedef enum { PHASES_OFF = 0, PHASES_1 = 1, PHASES_3 = 3 } PhaseMode;
+static const char* phase_names[] = {"OFF", "1-phasig", "3-phasig"};   // DEBUG
+
 typedef struct { PhaseMode active_phases; int16_t target_current_da; } ChargeCommand;
 typedef struct { int16_t delay_line[NUM_TAPS]; uint8_t write_idx; uint8_t decimation_counter; } FIR_FilterState;
 typedef struct { PhaseMode current_state; uint16_t timer_up; uint16_t timer_down; } PhaseHysteresis;
 typedef enum { ZCS_IDLE = 0, ZCS_WAIT_CAR_STOP, ZCS_WAIT_RELAY_SETTLE } ZCS_State;
+static const char* zcs_names[] = {"IDLE", "WAIT_CAR_STOP", "WAIT_RELAY_SETTLE"}; // DEBUG
+
 typedef struct {
     ZCS_State state;
     PhaseMode actual_hardware_phases;
@@ -109,7 +114,7 @@ void FIR_Init(FIR_FilterState* state) {
 uint8_t FIR_Process(FIR_FilterState* state, int16_t in_sample, const int16_t* coeffs, int16_t* out_sample) {
     SAFE_ASSERT(state != NULL);
     SAFE_ASSERT(coeffs != NULL);
-    SAFE_ASSERT(out_sample != NULL);   // wieder eingefügt
+    SAFE_ASSERT(out_sample != NULL);
 
     state->delay_line[state->write_idx] = in_sample;
     uint8_t new_output_available = 0;
@@ -144,10 +149,13 @@ void Hysteresis_Init(PhaseHysteresis* hyst) {
     hyst->current_state = PHASES_1;
     hyst->timer_up = 0;
     hyst->timer_down = 0;
+    printf("[HYST] Initialzustand: 1-phasig\n"); // DEBUG
 }
 
 PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
     SAFE_ASSERT(hyst != NULL);
+    PhaseMode old = hyst->current_state;
+
     if (hyst->current_state == PHASES_1) {
         if (pv_surplus_w >= THRESHOLD_1_TO_3_W) {
             hyst->timer_up++;
@@ -155,6 +163,7 @@ PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
                 hyst->current_state = PHASES_3;
                 hyst->timer_up = 0;
                 hyst->timer_down = 0;
+                printf("[HYST] Umschaltung 1→3 nach %ds (PV=%ld W)\n", DELAY_UP_SECONDS, pv_surplus_w); // DEBUG
             }
         } else {
             hyst->timer_up = 0;
@@ -166,11 +175,13 @@ PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
                 hyst->current_state = PHASES_1;
                 hyst->timer_down = 0;
                 hyst->timer_up = 0;
+                printf("[HYST] Umschaltung 3→1 nach %ds (PV=%ld W)\n", DELAY_DOWN_SECONDS, pv_surplus_w); // DEBUG
             }
         } else {
             hyst->timer_down = 0;
         }
     }
+
     return hyst->current_state;
 }
 
@@ -182,9 +193,21 @@ ChargeCommand Calculate_Charge_Power(int32_t pv_surplus_w, PhaseMode active_phas
     }
     int32_t denominator = (int32_t)active_phases * VOLTAGE_LN_V;
     int16_t current_da = (int16_t)((pv_surplus_w * 10) / denominator);
-    if (current_da < MIN_CHARGE_CURRENT_DA) cmd.target_current_da = 0;
-    else if (current_da > MAX_CHARGE_CURRENT_DA) cmd.target_current_da = MAX_CHARGE_CURRENT_DA;
-    else cmd.target_current_da = current_da;
+    
+    // Grenzen anwenden und ggf. Grund ausgeben
+    if (current_da < MIN_CHARGE_CURRENT_DA) {
+        if (current_da != 0) // Nur melden, wenn es tatsächlich geändert wird
+            printf("[LIMIT] Strom %d.%dA < Minimum (%d.%dA) → wird auf 0 gesetzt\n", 
+                   current_da/10, current_da%10, MIN_CHARGE_CURRENT_DA/10, MIN_CHARGE_CURRENT_DA%10);
+        cmd.target_current_da = 0;
+    } else if (current_da > MAX_CHARGE_CURRENT_DA) {
+        printf("[LIMIT] Strom %d.%dA > Maximum (%d.%dA) → wird auf %d.%dA begrenzt\n",
+               current_da/10, current_da%10, MAX_CHARGE_CURRENT_DA/10, MAX_CHARGE_CURRENT_DA%10,
+               MAX_CHARGE_CURRENT_DA/10, MAX_CHARGE_CURRENT_DA%10);
+        cmd.target_current_da = MAX_CHARGE_CURRENT_DA;
+    } else {
+        cmd.target_current_da = current_da;
+    }
     return cmd;
 }
 
@@ -200,10 +223,13 @@ void HardwareController_Init(HardwareController* hw) {
     bool pwm_ok = Set_PWM_Output_Amps(0);
     bool relay_ok = Set_Relays(PHASES_1);
     hw->hardware_fault = (!pwm_ok || !relay_ok);
+    if (hw->hardware_fault) printf("[HW] Initialisierung fehlgeschlagen!\n"); // DEBUG
 }
 
 void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
     SAFE_ASSERT(hw != NULL);
+    ZCS_State old_state = hw->state; // DEBUG
+
     switch (hw->state) {
         case ZCS_IDLE:
             if ((cmd.active_phases == PHASES_1 || cmd.active_phases == PHASES_3) &&
@@ -258,6 +284,17 @@ void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
             }
             break;
     }
+
+    // DEBUG: Zustandswechsel protokollieren
+    if (old_state != hw->state) {
+        printf("[ZCS] %s → %s\n", zcs_names[old_state], zcs_names[hw->state]);
+    }
+    // DEBUG: Fehlerstatus ausgeben
+    static bool last_fault = false;
+    if (hw->hardware_fault != last_fault) {
+        printf("[HW] hardware_fault = %s\n", hw->hardware_fault ? "true" : "false");
+        last_fault = hw->hardware_fault;
+    }
 }
 
 ISR(TIMER1_COMPA_vect) {
@@ -282,7 +319,7 @@ void* wallbox_thread(void* arg) {
     while(1) {
         if (timer_flag) {
             timer_flag = false;
-            timer_overrun = false;   // Flag zurücksetzen
+            timer_overrun = false;
 
             int16_t raw_pv = Read_PV_Surplus_Watts();
 
@@ -290,9 +327,18 @@ void* wallbox_thread(void* arg) {
                 last_valid_pv = raw_pv;
             } else {
                 last_valid_pv = 0;
+                // DEBUG: Sensorfehler
+                static uint8_t last_err = 0;
+                if (sensor_error_counter != last_err) {
+                    printf("[SENSOR] Fehlerzähler = %d\n", sensor_error_counter);
+                    last_err = sensor_error_counter;
+                }
             }
 
             if (sensor_error_counter >= PV_MAX_ERRORS || hw_controller.hardware_fault) {
+                if (current_cmd.active_phases != PHASES_OFF || current_cmd.target_current_da != 0) {
+                    printf("[SAFETY] Not-Aus! (Fehler=%d, hw_fault=%d)\n", sensor_error_counter, hw_controller.hardware_fault);
+                }
                 current_cmd.active_phases = PHASES_OFF;
                 current_cmd.target_current_da = 0;
             } else {
@@ -313,7 +359,7 @@ void* wallbox_thread(void* arg) {
             }
         }
 
-        usleep(100);   // kurze Pause, um CPU-Last zu reduzieren
+        usleep(100);
     }
     return NULL;
 }
@@ -324,58 +370,73 @@ uint32_t sim_tick = 0;
 bool i2c_dead = false;
 
 int16_t Read_PV_Surplus_Watts(void) {
-    // Simulierte PV-Werte: erst niedrig, dann hoch, dann wieder runter
-    if (sim_tick < 500) return 1200;   // 1,2 kW
-    if (sim_tick < 1500) return 6000;  // 6 kW -> löst Umschaltung aus
-    return 1500;                        // 1,5 kW -> Rückschaltung
+    int16_t val;
+    if (sim_tick < 500) val = 1200;
+    else if (sim_tick < 1500) val = 6000;
+    else val = 1500;
+    // DEBUG: PV-Wertänderung ausgeben
+    static int16_t last_val = -1;
+    if (val != last_val) {
+        printf("[PV] Neue Leistung: %d W\n", val);
+        last_val = val;
+    }
+    return val;
 }
 
 bool Set_PWM_Output_Amps(int16_t da) {
     if (i2c_dead) return false;
-    printf("[ACT] PWM: %d.%d A\n", da/10, da%10);
+    // Reduzierte Ausgabe: nur jede 10. Änderung oder bei Abweichung
+    static int16_t last_da = -1;
+    static int pwm_counter = 0;
+    pwm_counter++;
+    if (da != last_da || pwm_counter % 10 == 0) {
+        printf("[ACT] PWM: %d.%d A\n", da/10, da%10);
+        last_da = da;
+    }
     return true;
 }
 
 bool Set_Relays(PhaseMode p) {
     if (i2c_dead) return false;
-    printf("[ACT] Relais: %d Phasen\n", p);
+    static PhaseMode last_phase = PHASES_OFF;
+    if (p != last_phase) {
+        printf("[ACT] Relais: %s\n", phase_names[p]);
+        last_phase = p;
+    }
     return true;
 }
 
 int main() {
-    printf("--- Wallbox V2.6 Simulation startet (korrigierte Version) ---\n");
+    printf("--- Wallbox V2.6 Simulation (mit ausführlichen Debug-Meldungen) ---\n");
     pthread_t thread;
     pthread_create(&thread, NULL, wallbox_thread, NULL);
 
     uint32_t last_wdt = 0;
+    uint32_t last_status_tick = 0;
 
     for (sim_tick = 0; sim_tick < 2500; sim_tick++) {
-        // Nach 22 Sekunden (2200 * 100ms) simulieren wir einen I2C-Ausfall
         if (sim_tick == 2200) {
             printf("\n[!] SIM: I2C BUS CRASH!\n");
             i2c_dead = true;
         }
 
-        // Timer-Interrupt alle 100 ms simulieren (jeder sim_tick = 100 ms)
         TIMER1_COMPA_vect();
+        usleep(5000); // 5ms Realzeit pro 100ms Sim-Tick
 
-        // In der Simulation warten wir 5 ms Echtzeit pro simuliertem 100-ms-Tick
-        usleep(5000);
-
-        // Alle 10 Schritte (1 s simuliert) Status ausgeben
-        if (sim_tick % 100 == 0) {
-            printf("[T=%2ds] PV: %4d W | WDT-Feeds (letzte Sek): %u\n",
-                   sim_tick/10,
-                   Read_PV_Surplus_Watts(),
-                   wdt_feed_count - last_wdt);
+        // Status alle 10 s (100 Ticks) ausgeben
+        if (sim_tick % 100 == 0 && sim_tick != last_status_tick) {
+            printf("[STATUS] t=%ds | PV=%d W | WDT-Feeds (letzte 10s): %u | HW-Fehler=%d | hw_fault=%d\n",
+                   sim_tick/10, Read_PV_Surplus_Watts(), wdt_feed_count - last_wdt,
+                   hw_controller.consecutive_hw_failures, hw_controller.hardware_fault);
             last_wdt = wdt_feed_count;
+            last_status_tick = sim_tick;
+        }
 
-            // Wenn der Watchdog nicht mehr gefüttert wird, sollte nach 2 s Reset kommen
-            if (wdt_feed_count == last_wdt && i2c_dead) {
-                printf("\n[SUCCESS] Watchdog hat System-Reset ausgeloest (wie erwartet)!\n");
-                printf("Simulation beendet.\n");
-                return 0;
-            }
+        // Watchdog-Überwachung
+        if (i2c_dead && wdt_feed_count == last_wdt && sim_tick > 2210) { // ca. 1s nach Crash
+            printf("\n[SUCCESS] Watchdog hat System-Reset ausgeloest (wie erwartet)!\n");
+            printf("Simulation beendet.\n");
+            return 0;
         }
     }
 
