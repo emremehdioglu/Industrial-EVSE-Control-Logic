@@ -14,13 +14,6 @@
  * - Logical Livelock Protection hinzugefügt: Watchdog wird bei dauerhaft 
  * fehlgeschlagener Hardware-Kommunikation absichtlich blockiert, um einen 
  * Kaltstart (System-Reset) zu erzwingen, statt im Zombie-Zustand zu verbleiben.
- * * Änderungen gegenüber 2.2:
- * - Overrun-Detection in der Timer-ISR hinzugefügt (Erkennung von Jitter/Task-Overruns).
- * * Änderungen gegenüber 2.1:
- * - Blockierendes _delay_ms(100) durch Timer1-Interrupt ersetzt (10 Hz).
- * - Watchdog-Reset nur noch nach erfolgreicher Regelung (Self‑Healing bei Absturz).
- * - Hauptschleife kann nun nebenläufige Aufgaben (z.B. Kommunikation) ausführen.
- * - Ausführliche Kommentare zur Timer-Konfiguration und zum neuen Watchdog-Konzept.
  *
  * Diese Software implementiert eine vollständige DSP-Pipeline inklusive:
  * - Kausaler FIR-Filterung mit wählbaren Fensterfunktionen (Sinc-Kern).
