@@ -1,12 +1,23 @@
 /**
  * @file wallbox_control.c
  * @brief Hochverfügbare, industrielle Steuerung für PV-Überschussladen.
- * @version 2.4
+ * @version 2.5
  *
- * Änderungen gegenüber 2.3:
+ * Änderungen gegenüber 2.4:
+ * - Flash-Speicher Optimierung: <assert.h> durch ressourcenschonendes Bare-Metal 
+ * SAFE_ASSERT Makro ersetzt. Führt bei Fehlern in den Livelock, den der Watchdog auflöst.
+ * - Überflüssiges <util/delay.h> entfernt.
+ * * Änderungen gegenüber 2.3:
  * - Logical Livelock Protection hinzugefügt: Watchdog wird bei dauerhaft 
  * fehlgeschlagener Hardware-Kommunikation absichtlich blockiert, um einen 
  * Kaltstart (System-Reset) zu erzwingen, statt im Zombie-Zustand zu verbleiben.
+ * * Änderungen gegenüber 2.2:
+ * - Overrun-Detection in der Timer-ISR hinzugefügt (Erkennung von Jitter/Task-Overruns).
+ * * Änderungen gegenüber 2.1:
+ * - Blockierendes _delay_ms(100) durch Timer1-Interrupt ersetzt (10 Hz).
+ * - Watchdog-Reset nur noch nach erfolgreicher Regelung (Self‑Healing bei Absturz).
+ * - Hauptschleife kann nun nebenläufige Aufgaben (z.B. Kommunikation) ausführen.
+ * - Ausführliche Kommentare zur Timer-Konfiguration und zum neuen Watchdog-Konzept.
  *
  * Diese Software implementiert eine vollständige DSP-Pipeline inklusive:
  * - Kausaler FIR-Filterung mit wählbaren Fensterfunktionen (Sinc-Kern).
@@ -20,11 +31,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
-#include <assert.h>
 #include <avr/pgmspace.h>
 #include <avr/wdt.h>
 #include <avr/interrupt.h>   // NEU: Für Interrupt-Steuerung
-#include <util/delay.h>       // Wird noch für Initialisierung genutzt, aber nicht mehr in der Hauptschleife
+
+/* ==========================================================================
+   0. BARE-METAL SAFETY MACROS
+   ========================================================================== */
+
+/** * @brief Custom Bare-Metal Assert.
+ * Spart massiv Flash-Speicher gegenüber <assert.h>.
+ * Führt bei einem Fehler in eine Endlosschleife, wodurch der Watchdog 
+ * absichtlich verhungert und nach 2 Sekunden einen sicheren System-Reset erzwingt.
+ */
+#define SAFE_ASSERT(expr) do { if (!(expr)) { while(1); } } while(0)
 
 /* ==========================================================================
    1. KUNDEN-KONFIGURATION (DSP & LOGIK)
@@ -187,7 +207,7 @@ extern bool    Set_Relays(PhaseMode phases);
  * @return true bei validem Messwert, false bei Ausreißern.
  */
 bool Validate_PV_Value(int16_t raw_val, uint8_t* error_counter) {
-    assert(error_counter != NULL);
+    SAFE_ASSERT(error_counter != NULL);
     if (raw_val < PV_LIMIT_LOW || raw_val > PV_LIMIT_HIGH) {
         if (*error_counter < PV_MAX_ERRORS) {
             (*error_counter)++;
@@ -203,7 +223,7 @@ bool Validate_PV_Value(int16_t raw_val, uint8_t* error_counter) {
  * @param state Zeiger auf die FIR-Struktur.
  */
 void FIR_Init(FIR_FilterState* state) {
-    assert(state != NULL);
+    SAFE_ASSERT(state != NULL);
     memset(state->delay_line, 0, sizeof(state->delay_line));
     state->write_idx = 0;
     state->decimation_counter = 0;
@@ -216,8 +236,8 @@ void FIR_Init(FIR_FilterState* state) {
  * @return 1 wenn ein neuer dezimierter Wert berechnet wurde, sonst 0.
  */
 uint8_t FIR_Process(FIR_FilterState* state, int16_t in_sample, const int16_t* coeffs, int16_t* out_sample) {
-    assert(state != NULL); 
-    assert(coeffs != NULL);
+    SAFE_ASSERT(state != NULL); 
+    SAFE_ASSERT(coeffs != NULL);
     
     // Sample-Einzug in den Ringpuffer
     state->delay_line[state->write_idx] = in_sample;
@@ -227,7 +247,7 @@ uint8_t FIR_Process(FIR_FilterState* state, int16_t in_sample, const int16_t* co
     state->decimation_counter++;
     if (state->decimation_counter >= DECIMATION_M) {
         state->decimation_counter = 0;
-        assert(out_sample != NULL);
+        SAFE_ASSERT(out_sample != NULL);
 
         // Faltung (MAC-Operationen)
         int32_t acc = 0;
@@ -264,7 +284,7 @@ uint8_t FIR_Process(FIR_FilterState* state, int16_t in_sample, const int16_t* co
  * @param hyst Zeiger auf die Hysterese-Struktur.
  */
 void Hysteresis_Init(PhaseHysteresis* hyst) {
-    assert(hyst != NULL);
+    SAFE_ASSERT(hyst != NULL);
     hyst->current_state = PHASES_1; 
     hyst->timer_up = 0;
     hyst->timer_down = 0;
@@ -275,7 +295,7 @@ void Hysteresis_Init(PhaseHysteresis* hyst) {
  * @param pv_surplus_w Der bereits geglättete PV-Leistungswert.
  */
 PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
-    assert(hyst != NULL);
+    SAFE_ASSERT(hyst != NULL);
     if (hyst->current_state == PHASES_1) {
         if (pv_surplus_w >= THRESHOLD_1_TO_3_W) {
             hyst->timer_up++;
@@ -340,7 +360,7 @@ ChargeCommand Calculate_Charge_Power(int32_t pv_surplus_w, PhaseMode active_phas
  * @brief Hardware-Boot-Initialisierung mit Selbsttest.
  */
 void HardwareController_Init(HardwareController* hw) {
-    assert(hw != NULL);
+    SAFE_ASSERT(hw != NULL);
     hw->state = ZCS_IDLE;
     hw->actual_hardware_phases = PHASES_1;
     hw->pending_phases = PHASES_1;
@@ -373,7 +393,7 @@ void HardwareController_Init(HardwareController* hw) {
  * bis die Kontakte eingeschwungen sind, bevor der neue Strom gesetzt wird.
  */
 void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
-    assert(hw != NULL);
+    SAFE_ASSERT(hw != NULL);
     switch (hw->state) {
         case ZCS_IDLE:
             if ((cmd.active_phases == PHASES_1 || cmd.active_phases == PHASES_3) && 
