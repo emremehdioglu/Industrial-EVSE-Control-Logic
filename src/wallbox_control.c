@@ -1,9 +1,12 @@
 /**
  * @file wallbox_control.c
  * @brief Hochverfügbare, industrielle Steuerung für PV-Überschussladen.
- * @version 2.5
+ * @version 2.6
  *
- * Änderungen gegenüber 2.4:
+ * Änderungen gegenüber 2.5:
+ * - Taktfrequenz-Agnostik: Automatischer Timer-Vergleichswert (TIMER_COMPARE_VAL) 
+ * basierend auf F_CPU implementiert, inklusive 16-MHz-Fallback.
+ * * Änderungen gegenüber 2.4:
  * - Flash-Speicher Optimierung: <assert.h> durch ressourcenschonendes Bare-Metal 
  * SAFE_ASSERT Makro ersetzt. Führt bei Fehlern in den Livelock, den der Watchdog auflöst.
  * - Überflüssiges <util/delay.h> entfernt.
@@ -36,7 +39,7 @@
 #include <avr/interrupt.h>   // NEU: Für Interrupt-Steuerung
 
 /* ==========================================================================
-   0. BARE-METAL SAFETY MACROS
+   0. BARE-METAL SAFETY MACROS & SYSTEM-TAKT
    ========================================================================== */
 
 /** * @brief Custom Bare-Metal Assert.
@@ -45,6 +48,13 @@
  * absichtlich verhungert und nach 2 Sekunden einen sicheren System-Reset erzwingt.
  */
 #define SAFE_ASSERT(expr) do { if (!(expr)) { while(1); } } while(0)
+
+#ifndef F_CPU
+#define F_CPU 16000000UL // Fallback: 16 MHz, falls nicht vom Compiler definiert
+#endif
+
+// Automatischer Vergleichswert für 10 Hz bei Prescaler 64
+#define TIMER_COMPARE_VAL (uint16_t)(((F_CPU) / 64 / 10) - 1)
 
 /* ==========================================================================
    1. KUNDEN-KONFIGURATION (DSP & LOGIK)
@@ -489,9 +499,8 @@ int main(void) {
     int16_t last_valid_pv = 0;
 
     // NEU: Timer1 für 10 Hz konfigurieren (CTC-Modus, Vorteiler 64)
-    // Annahme: Taktfrequenz 16 MHz. Bei abweichendem Takt muss OCR1A angepasst werden.
     TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC, Vorteiler 64
-    OCR1A = 24999;  // (16000000 / 64) / 10 - 1 = 24999
+    OCR1A = TIMER_COMPARE_VAL;  // Automatisch berechnet anhand F_CPU (z.B. 24999 bei 16 MHz)
     TIMSK1 = (1 << OCIE1A); // Interrupt bei Compare Match A aktivieren
     sei(); // Globale Interrupts einschalten
 
