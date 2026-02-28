@@ -7,12 +7,6 @@
  * - Taktfrequenz-Agnostik: Automatischer Timer-Vergleichswert (TIMER_COMPARE_VAL) 
  * basierend auf F_CPU implementiert, inklusive 16-MHz-Fallback.
  *
- * Diese Software implementiert eine vollständige DSP-Pipeline inklusive:
- * - Kausaler FIR-Filterung mit wählbaren Fensterfunktionen (Sinc-Kern).
- * - Polyphasen-Dezimierung zur Reduktion der CPU-Last auf AVR-Systemen.
- * - Zustandsbasierter Hysterese für materialschonende Phasenumschaltung.
- * - Hardware-Schutzschaltung (Zero Current Switching) mit Self-Healing.
- * - Mehrstufiger Sicherheitsarchitektur (Static Asserts, Watchdog, Pointer-Checks).
  */
 
 #include <stdint.h>
