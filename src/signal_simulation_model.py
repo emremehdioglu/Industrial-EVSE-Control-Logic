@@ -1,6 +1,6 @@
 /**
  * ==========================================================================
- * WALLBOX CONTROL SYSTEM V2.6 - PROFESSIONELLER SIMULATIONSBERICHT
+ * WALLBOX CONTROL SYSTEM V2.6 - SIMULATIONSBERICHT
  * ==========================================================================
  *
  * Diese Simulation demonstriert das intelligente Verhalten der Wallbox-Steuerung.
@@ -101,7 +101,7 @@ bool Set_PWM_Output_Amps(int16_t deci_amps);
 bool Set_Relays(PhaseMode phases);
 
 /* ==========================================================================
-   Logikbausteine (unverändert, aber Bericht erzeugende Debugs)
+   Logikbausteine
    ========================================================================== */
 
 bool Validate_PV_Value(int16_t raw_val, uint8_t* error_counter) {
