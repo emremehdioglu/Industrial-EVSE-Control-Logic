@@ -1,7 +1,12 @@
 /**
  * @file wallbox_control.c
  * @brief Hochverfügbare, industrielle Steuerung für PV-Überschussladen.
- * @version 2.2
+ * @version 2.4
+ *
+ * Änderungen gegenüber 2.3:
+ * - Logical Livelock Protection hinzugefügt: Watchdog wird bei dauerhaft 
+ * fehlgeschlagener Hardware-Kommunikation absichtlich blockiert, um einen 
+ * Kaltstart (System-Reset) zu erzwingen, statt im Zombie-Zustand zu verbleiben.
  *
  * Diese Software implementiert eine vollständige DSP-Pipeline inklusive:
  * - Kausaler FIR-Filterung mit wählbaren Fensterfunktionen (Sinc-Kern).
@@ -85,14 +90,12 @@ _Static_assert(DELAY_DOWN_SECONDS <= 65535, "DELAY_DOWN_SECONDS ueberschreitet u
 
 /**
  * @brief FIR-Filterkoeffizienten für verschiedene Fensterfunktionen.
- * 
- * Die Koeffizienten wurden mit dem Sinc-Fensterungsverfahren entworfen und
+ * * Die Koeffizienten wurden mit dem Sinc-Fensterungsverfahren entworfen und
  * sind für eine Abtastfrequenz von 10 Hz ausgelegt (angenommen). Die Ziel-
  * Grenzfrequenz liegt bei ca. 2 Hz (angepasst an die träge PV-Leistungs-
  * änderung). Bei Änderung der Abtastfrequenz müssen die Koeffizienten neu
  * berechnet werden, da sich sonst die Filtercharakteristik verschiebt.
- * 
- * Die Werte sind bereits skaliert und können direkt in der MAC-Operation
+ * * Die Werte sind bereits skaliert und können direkt in der MAC-Operation
  * verwendet werden. Die Summe der Koeffizienten ist bei allen Fenstern
  * etwa 32768, sodass der Gleichsignal-Durchlassfaktor 1 beträgt.
  */
@@ -162,6 +165,7 @@ typedef struct {
     uint16_t timer;
     bool hardware_fault; 
     uint8_t retry_counter; 
+    uint8_t consecutive_hw_failures; // NEU: Zählt ununterbrochene Hardware-Ausfälle
 } HardwareController;
 
 /* ==========================================================================
@@ -300,14 +304,12 @@ PhaseMode Hysteresis_Process(PhaseHysteresis* hyst, int32_t pv_surplus_w) {
 
 /**
  * @brief Berechnet den Soll-Strom in Deziamper pro Phase.
- * 
- * Physikalische Formel: I_pro_Phase = P_gesamt / (U_Phase * Anzahl_Phasen)
+ * * Physikalische Formel: I_pro_Phase = P_gesamt / (U_Phase * Anzahl_Phasen)
  * (hier vereinfacht für ohmsche Last, cos φ = 1).
  * Da der Strom in Dezi-Ampere (1/10 A) ausgegeben werden soll, wird das
  * Ergebnis mit 10 multipliziert. Beispiel: 2300 W / (230 V * 3) = 3,333 A
  * -> 33,33 dA. Durch die Multiplikation mit 10 im Zähler ((pv_surplus_w * 10) / denominator) ergibt sich der Wert direkt in dA.
- * 
- * @param pv_surplus_w Geglättete PV-Leistung in Watt.
+ * * @param pv_surplus_w Geglättete PV-Leistung in Watt.
  * @param active_phases Gewünschte Phasenanzahl (1 oder 3).
  * @return ChargeCommand mit Phasenmodus und Zielstrom.
  */
@@ -344,25 +346,31 @@ void HardwareController_Init(HardwareController* hw) {
     hw->pending_phases = PHASES_1;
     hw->timer = 0;
     hw->retry_counter = 0;
+    hw->consecutive_hw_failures = 0;
     
     // Kritischer HW-Check beim Systemstart
     bool pwm_ok = Set_PWM_Output_Amps(0);
     bool relay_ok = Set_Relays(PHASES_1);
-    hw->hardware_fault = (!pwm_ok || !relay_ok);
+    
+    if (!pwm_ok || !relay_ok) {
+        hw->hardware_fault = true;
+        hw->consecutive_hw_failures++;
+    } else {
+        hw->hardware_fault = false;
+    }
 }
 
 /**
  * @brief Zustandsmaschine für sichere Hardware-Steuerung (ZCS & Self-Healing).
  * @details Überwacht PWM- und Relaisrückmeldungen. Wenn die Hardware sich erholt,
  * löscht das System den Fehlerzustand automatisch (Self-Healing).
- * 
- * Zustände:
+ * * Zustände:
  * - ZCS_IDLE: Keine laufende Umschaltung. Entweder wird der Strom direkt gesetzt
- *   oder bei einem Phasenwechsel in den WAIT_CAR_STOP-Zustand gewechselt.
+ * oder bei einem Phasenwechsel in den WAIT_CAR_STOP-Zustand gewechselt.
  * - ZCS_WAIT_CAR_STOP: Nachdem PWM auf 0 gesetzt wurde, wird gewartet (5 s), damit
- *   der Strom tatsächlich abklingt, bevor die Relais umgeschaltet werden.
+ * der Strom tatsächlich abklingt, bevor die Relais umgeschaltet werden.
  * - ZCS_WAIT_RELAY_SETTLE: Nach dem Umschalten der Relais wird kurz (0,5 s) gewartet,
- *   bis die Kontakte eingeschwungen sind, bevor der neue Strom gesetzt wird.
+ * bis die Kontakte eingeschwungen sind, bevor der neue Strom gesetzt wird.
  */
 void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
     assert(hw != NULL);
@@ -378,16 +386,20 @@ void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
                     hw->pending_phases = cmd.active_phases;
                     hw->retry_counter = 0;
                     hw->hardware_fault = false; // Heilung
+                    hw->consecutive_hw_failures = 0; // Befehl erfolgreich
                 } else {
                     hw->hardware_fault = true;
+                    if (hw->consecutive_hw_failures < 255) hw->consecutive_hw_failures++;
                 }
             } else {
                 // Regelbetrieb
                 if (Set_PWM_Output_Amps(cmd.target_current_da)) {
                     hw->hardware_fault = false;
                     hw->retry_counter = 0; // Auch hier Zähler zurücksetzen
+                    hw->consecutive_hw_failures = 0; // Befehl erfolgreich
                 } else {
                     hw->hardware_fault = true;
+                    if (hw->consecutive_hw_failures < 255) hw->consecutive_hw_failures++;
                 }
             }
             break;
@@ -400,7 +412,9 @@ void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
                     hw->state = ZCS_WAIT_RELAY_SETTLE;
                     hw->timer = 0;
                     hw->hardware_fault = false;
+                    hw->consecutive_hw_failures = 0; // Befehl erfolgreich
                 } else {
+                    if (hw->consecutive_hw_failures < 255) hw->consecutive_hw_failures++;
                     if (++hw->retry_counter >= MAX_HW_RETRIES) {
                         hw->hardware_fault = true;
                     }
@@ -422,8 +436,12 @@ void Execute_Hardware_Command(HardwareController* hw, ChargeCommand cmd) {
 // NEU: Timer-Interrupt für 10-Hz-Takt
 // ==========================================================================
 volatile bool timer_flag = false;   // Flag wird im Interrupt gesetzt
+volatile bool timer_overrun = false; // Flag für Task-Overrun Detektion
 
 ISR(TIMER1_COMPA_vect) {
+    if (timer_flag) {
+        timer_overrun = true; // Warnung: Letzter Durchlauf war noch nicht fertig!
+    }
     timer_flag = true;
 }
 
@@ -462,6 +480,13 @@ int main(void) {
         // Nur wenn der Timer-Interrupt ein neues 100-ms-Intervall signalisiert
         if (timer_flag) {
             timer_flag = false; // Flag zurücksetzen
+            
+            // Overrun-Verarbeitung (Self-Healing für Jitter)
+            if (timer_overrun) {
+                // Hier könnte in Zukunft eine Fehler-LED getriggert oder ein Zähler erhöht werden.
+                // Für den stabilen Betrieb löschen wir das Flag, damit das System weiterläuft.
+                timer_overrun = false;
+            }
 
             // --- Beginn der Regelung (wie bisher, jedoch ohne _delay_ms) ---
             int16_t raw_pv = Read_PV_Surplus_Watts();
@@ -490,10 +515,12 @@ int main(void) {
             Execute_Hardware_Command(&hw_controller, current_cmd);
             // --- Ende der Regelung ---
 
-            // NEU: Watchdog-Reset NUR nach erfolgreicher Regelung
-            // Falls die Regelung in einer Endlosschleife hängen bleibt,
-            // wird der Watchdog nicht mehr bedient und löst nach 2 Sekunden einen Reset aus.
-            wdt_reset();
+            // NEU: Watchdog-Reset NUR, wenn die Hardware noch ansprechbar ist!
+            // Wenn 10 Schreibbefehle in Folge (1 Sekunde) scheitern,
+            // füttern wir den Watchdog absichtlich nicht mehr -> Kaltstart erzwingen.
+            if (hw_controller.consecutive_hw_failures < 10) {
+                wdt_reset();
+            }
         }
 
         // Platz für andere Aufgaben (z.B. UART-Kommunikation, Tasterabfrage, …)
